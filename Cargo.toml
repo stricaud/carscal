@@ -1,0 +1,18 @@
+[package]
+name = "carscal"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal packet analyzer — a tiny Wireshark for the TUI, in Rust. Rust replica of carcal."
+license = "MIT"
+repository = "https://github.com/stricaud/carscal"
+authors = ["Seb Tricaud <sebastien.tricaud@proton.me>"]
+
+[dependencies]
+# path dep for 0.1.13 (image letterbox + About rework); -> "0.1.13" after publish.
+gtcaca = { path = "../gtcaca/src/bindings/rust/gtcaca" }
+libpcapng = "0.15.5"
+# Embedded scripting (generalized MQS). Vendored LuaJIT — fast, no system dependency.
+mlua = { version = "0.9", features = ["luajit", "vendored"] }
+
+[profile.release]
+opt-level = 3
