@@ -8,7 +8,7 @@ repository = "https://github.com/stricaud/carscal"
 authors = ["Seb Tricaud <sebastien.tricaud@proton.me>"]
 
 [dependencies]
-gtcaca = "0.1.14"
+gtcaca = "0.1.15"
 libpcapng = "0.15.6"
 # Embedded scripting (generalized MQS). Vendored LuaJIT — fast, no system dependency.
 mlua = { version = "0.9", features = ["luajit", "vendored"] }

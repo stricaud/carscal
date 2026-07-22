@@ -20,8 +20,6 @@ pub struct Conversation {
     pub b_to_a: u64, // packets b→a
     pub first_us: u64,
     pub last_us: u64,
-    /// A display filter selecting exactly this conversation's packets.
-    pub filter: String,
 }
 
 impl Conversation {
@@ -42,7 +40,6 @@ struct ConvAcc {
     b_to_a: u64,
     first_us: u64,
     last_us: u64,
-    filter: String,
 }
 
 /// All conversations, sorted by packet count (descending).
@@ -61,26 +58,17 @@ pub fn conversations(cap: &Capture) -> Vec<Conversation> {
         let key = (l.proto, lo.0.clone(), lo.1, hi.0.clone(), hi.1);
         let proto = if l.proto == 6 { "TCP" } else { "UDP" };
 
-        let acc = map.entry(key).or_insert_with(|| {
-            let ipk = if l.src_ip_raw.len() == 16 { "ipv6" } else { "ip" };
-            let l4k = if l.proto == 6 { "tcp" } else { "udp" };
-            let filter = format!(
-                "{ipk}.addr == {} && {ipk}.addr == {} && {l4k}.port == {} && {l4k}.port == {}",
-                l.src_ip, l.dst_ip, l.src_port, l.dst_port
-            );
-            ConvAcc {
-                proto,
-                a: format!("{}:{}", l.src_ip, l.src_port),
-                b: format!("{}:{}", l.dst_ip, l.dst_port),
-                a_raw: (l.src_ip_raw.clone(), l.src_port),
-                packets: 0,
-                bytes: 0,
-                a_to_b: 0,
-                b_to_a: 0,
-                first_us: pkt.ts_us,
-                last_us: pkt.ts_us,
-                filter,
-            }
+        let acc = map.entry(key).or_insert_with(|| ConvAcc {
+            proto,
+            a: format!("{}:{}", l.src_ip, l.src_port),
+            b: format!("{}:{}", l.dst_ip, l.dst_port),
+            a_raw: (l.src_ip_raw.clone(), l.src_port),
+            packets: 0,
+            bytes: 0,
+            a_to_b: 0,
+            b_to_a: 0,
+            first_us: pkt.ts_us,
+            last_us: pkt.ts_us,
         });
         acc.packets += 1;
         acc.bytes += pkt.origlen as u64;
@@ -105,7 +93,6 @@ pub fn conversations(cap: &Capture) -> Vec<Conversation> {
             b_to_a: c.b_to_a,
             first_us: c.first_us,
             last_us: c.last_us,
-            filter: c.filter,
         })
         .collect();
     out.sort_by(|x, y| y.packets.cmp(&x.packets));

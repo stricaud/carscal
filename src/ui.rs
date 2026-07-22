@@ -78,6 +78,7 @@ mod act {
     pub const DECODERS: i32 = 27;
     pub const EXPORT_HTTP: i32 = 28;
     pub const EXPORT_SMB: i32 = 29;
+    pub const STATS_ENTITY: i32 = 30;
 }
 
 thread_local! {
@@ -156,8 +157,9 @@ fn build_menu() -> Menus {
 
     let stats = m.add_entry("Statistics");
     needs.push((stats, m.add_item(stats, "IO Graph", "I", menu_cb, id(act::IOGRAPH))));
-    needs.push((stats, m.add_item(stats, "Conversations", "", menu_cb, id(act::STATS_CONV))));
+    needs.push((stats, m.add_item(stats, "Conversations (NetFlow)", "", menu_cb, id(act::STATS_CONV))));
     needs.push((stats, m.add_item(stats, "Endpoints", "", menu_cb, id(act::STATS_ENDPOINTS))));
+    needs.push((stats, m.add_item(stats, "Entity Explorer\u{2026}", "", menu_cb, id(act::STATS_ENTITY))));
     needs.push((stats, m.add_item(stats, "Protocol Hierarchy", "", menu_cb, id(act::STATS_PROTO))));
 
     let help = m.add_entry("Help");
@@ -675,24 +677,36 @@ pub fn run(cap: Capture) -> Result<(), String> {
                         show_text_modal(&ctx, &app, "Follow Stream", &lines);
                     }
                     act::STATS_CONV => {
-                        // Pick a conversation → filter the main view to it (the
-                        // user can clear the filter to return to all packets).
-                        if let Some(expr) = conversations_window(&ctx, &app, &state) {
-                            if let Ok(f) = Filter::compile(&expr) {
-                                let mut st = state.borrow_mut();
-                                st.filter = f;
-                                st.filter_text = expr;
-                                st.sel = 0;
-                                st.apply_filter();
-                                drop(st);
-                                goto(0);
-                                focus = Focus::Table;
-                            }
+                        // Hosts ▸ Conversations tree + packet table. Enter on a
+                        // packet jumps to it in the main list.
+                        if let Some(row) = run_netflow(&ctx, &app, &state) {
+                            goto(row);
+                            focus = Focus::Table;
                         }
                     }
+                    act::STATS_ENTITY => {
+                        let model = {
+                            let st = state.borrow();
+                            crate::statstree::ArenaModel(std::rc::Rc::new(
+                                crate::statstree::build_entity_explorer(&st.cap, &st.rows),
+                            ))
+                        };
+                        run_tree_window(&ctx, &app, "Entity Explorer", "Connections", Box::new(model));
+                    }
                     act::STATS_PROTO => {
-                        let lines = proto_lines(&state.borrow().cap);
-                        show_text_modal(&ctx, &app, "Protocol Hierarchy", &lines);
+                        let model = {
+                            let st = state.borrow();
+                            crate::statstree::ArenaModel(std::rc::Rc::new(
+                                crate::statstree::build_proto_hierarchy(&st.cap),
+                            ))
+                        };
+                        run_tree_window(
+                            &ctx,
+                            &app,
+                            "Protocol Hierarchy Statistics",
+                            "Protocol  (Right/Enter expand, Esc close)",
+                            Box::new(model),
+                        );
                     }
                     act::ABOUT => show_about(&ctx, &app),
                     act::SAVE => {
@@ -1131,56 +1145,568 @@ unsafe fn field_at_offset(
     best
 }
 
-/// Packets-per-interval histograms for the IO graph: `(all, filter-match, span
-/// seconds)`. Both series have `n` buckets across the capture's time span.
-fn io_buckets(cap: &Capture, rows: &[usize], n: usize) -> (Vec<f64>, Vec<f64>, f64) {
-    let n = n.max(1);
-    let first = cap.first_ts_us;
-    let last = cap.pkts.last().map(|p| p.ts_us).unwrap_or(first).max(first);
-    let span = last.saturating_sub(first).max(1);
-    let idx = |ts: u64| -> usize {
-        let b = (ts.saturating_sub(first) as u128 * (n as u128 - 1).max(1)) / span as u128;
-        (b as usize).min(n - 1)
-    };
-    let mut all = vec![0.0f64; n];
-    for p in &cap.pkts {
-        all[idx(p.ts_us)] += 1.0;
-    }
-    let mut filt = vec![0.0f64; n];
-    for &r in rows {
-        if let Some(p) = cap.pkts.get(r) {
-            filt[idx(p.ts_us)] += 1.0;
+
+// ── Statistics trees (Protocol Hierarchy, Conversations, Entity Explorer) ────
+
+/// A generic expandable-tree modal (Protocol Hierarchy, Entity Explorer).
+/// Right/Enter expand, Left collapse, ↑/↓ move, Esc/q close.
+fn run_tree_window(
+    ctx: &Gtcaca,
+    app: &gtcaca::Application,
+    title: &str,
+    subtitle: &str,
+    model: Box<dyn gtcaca::TreeModel>,
+) {
+    let win = gtcaca::Window::centered_fraction(app, Some(title), 0.85, 0.8);
+    let c = win.content(PAD);
+    let tree = Tree::new(&win, c.x, c.y, c.width, c.height, std::ptr::null_mut(), model);
+    tree.set_title(subtitle);
+    tree.set_focus(true);
+    tree.key(key::RIGHT); // open the first row so there's something to see
+    loop {
+        ctx.redraw();
+        tree.draw();
+        match gtcaca::poll_key(-1) {
+            Some(k) if k == key::ESCAPE || k == b'q' as i32 => break,
+            Some(k) => {
+                tree.key(k);
+            }
+            None => {}
         }
     }
-    (all, filt, span as f64 / 1e6)
+    win.close();
 }
 
-/// Statistics ▸ IO Graph: a modal line chart of packets/interval (green = all,
-/// yellow = current filter match), drawn with gtcaca's line chart. Blocks until
-/// a close key (Esc / Enter / q).
-fn run_io_graph(ctx: &Gtcaca, app: &gtcaca::Application, state: &Rc<RefCell<AppState>>) {
-    let (all, filt, span_s) = {
-        let st = state.borrow();
-        io_buckets(&st.cap, &st.rows, 60)
-    };
-    let win = gtcaca::Window::centered_fraction(
-        app,
-        Some("IO Graph — packets/interval  (green: all, yellow: filter)"),
-        0.8, 0.75,
-    );
-    let c = win.content(PAD);
-    let chart = gtcaca::Linechart::new(&win, c.x, c.y, c.width, c.height);
-    chart.add_series(&all, caca::GREEN);
-    chart.add_series(&filt, caca::YELLOW);
-    if span_s > 0.0 {
-        chart.set_xspan(span_s, "s");
+/// The packet sub-table of the NetFlow window: the packets of the selected flow.
+struct NfTable {
+    state: Rc<RefCell<AppState>>,
+    flow_rows: Rc<Vec<Vec<usize>>>,
+    selflow: Rc<std::cell::Cell<i64>>,
+}
+
+impl TableModel for NfTable {
+    fn row_count(&self) -> i64 {
+        let f = self.selflow.get();
+        if f < 0 {
+            return 0;
+        }
+        self.flow_rows.get(f as usize).map(|r| r.len() as i64).unwrap_or(0)
     }
+    fn headers(&self) -> Vec<String> {
+        ["No.", "Time", "Source", "Destination", "Protocol", "Length", "Info"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+    fn cell(&self, row: i64, col: i32) -> String {
+        let f = self.selflow.get();
+        if f < 0 {
+            return String::new();
+        }
+        let Some(rows) = self.flow_rows.get(f as usize) else { return String::new() };
+        let Some(&rr) = rows.get(row as usize) else { return String::new() };
+        let mut st = self.state.borrow_mut();
+        let Some(pidx) = st.rows.get(rr).copied() else { return String::new() };
+        let first = st.first_ts_us;
+        let s = dissect::summarize(&mut st.cap.pkts[pidx]);
+        let pkt = &st.cap.pkts[pidx];
+        match col {
+            0 => pkt.number.to_string(),
+            1 => format!("{:.6}", (pkt.ts_us.saturating_sub(first)) as f64 / 1_000_000.0),
+            2 => s.src,
+            3 => s.dst,
+            4 => s.proto,
+            5 => pkt.origlen.to_string(),
+            _ => s.info,
+        }
+    }
+}
+
+/// Statistics ▸ Conversations (NetFlow): a Hosts ▸ Conversations tree on top and
+/// a packet table (of the selected conversation) below. Tab switches panes;
+/// Enter on a packet returns its row so the caller can jump to it in the main
+/// list. Esc/q closes.
+fn run_netflow(ctx: &Gtcaca, app: &gtcaca::Application, state: &Rc<RefCell<AppState>>) -> Option<usize> {
+    let (arena, flow_rows) = {
+        let st = state.borrow();
+        crate::statstree::build_conversations(&st.cap, &st.rows)
+    };
+    let arena = Rc::new(arena);
+    let flow_rows = Rc::new(flow_rows);
+    if flow_rows.is_empty() {
+        message("NetFlow", "No conversations found.");
+        return None;
+    }
+
+    let win = gtcaca::Window::centered_fraction(app, Some("NetFlow \u{2014} Conversations"), 0.9, 0.85);
+    let c = win.content(PAD);
+    let tree_h = (c.height * 55 / 100).clamp(6, c.height - 6);
+    let tree = Tree::new(
+        &win,
+        c.x,
+        c.y,
+        c.width,
+        tree_h,
+        std::ptr::null_mut(),
+        Box::new(crate::statstree::ArenaModel(arena.clone())),
+    );
+    tree.set_title("Hosts \u{25b8} Conversations");
+    let selflow = Rc::new(std::cell::Cell::new(-1i64));
+    let table = Table::new(
+        &win,
+        c.x,
+        c.y + tree_h + 1,
+        c.width,
+        (c.height - tree_h - 2).max(3),
+        Box::new(NfTable { state: Rc::clone(state), flow_rows: Rc::clone(&flow_rows), selflow: Rc::clone(&selflow) }),
+    );
+    let _help = Label::new(&win, "\u{2191}\u{2193}/\u{2192} tree   Tab packets   Enter jump   Esc close", c.x, c.y + c.height - 1);
+
+    // Point the table at the flow the tree has selected.
+    let sync = |tree: &Tree, table: &Table| {
+        selflow.set(arena.tag_of(tree.selected()));
+        table.set_current(0, 0);
+    };
+    tree.key(key::RIGHT); // open the first host
+    sync(&tree, &table);
+
+    let mut on_tree = true;
+    let mut jump: Option<usize> = None;
+    loop {
+        tree.set_focus(on_tree);
+        table.set_focus(!on_tree);
+        ctx.redraw();
+        tree.draw();
+        table.draw();
+        match gtcaca::poll_key(-1) {
+            Some(k) if k == key::ESCAPE || k == b'q' as i32 => break,
+            Some(k) if k == key::TAB => on_tree = !on_tree,
+            Some(k) if on_tree => {
+                tree.key(k);
+                sync(&tree, &table);
+            }
+            Some(k) if k == key::RETURN => {
+                let f = selflow.get();
+                if f >= 0 {
+                    if let Some(rows) = flow_rows.get(f as usize) {
+                        if let Some(&rr) = rows.get(table.current_row() as usize) {
+                            jump = Some(rr);
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(k) => {
+                table.key(k);
+            }
+            None => {}
+        }
+    }
+    win.close();
+    jump
+}
+
+// ── IO Graph (Wireshark-style: multiple series, filters, colours, styles) ────
+
+const IOG_INTERVALS: [f64; 6] = [0.001, 0.01, 0.1, 1.0, 10.0, 60.0];
+const IOG_PALETTE: [u8; 8] = [
+    caca::GREEN, caca::YELLOW, caca::LIGHTRED, caca::LIGHTCYAN,
+    caca::LIGHTMAGENTA, caca::WHITE, caca::LIGHTBLUE, caca::BROWN,
+];
+
+/// A Y-axis mode. The `*Field` variants aggregate a chosen field's value per bin.
+#[derive(Clone, Copy, PartialEq)]
+enum YUnit {
+    Packets,
+    Bytes,
+    Bits,
+    Sum,
+    CountFrames,
+    CountFields,
+    Max,
+    Min,
+    Avg,
+}
+
+impl YUnit {
+    const ALL: [YUnit; 9] = [
+        YUnit::Packets, YUnit::Bytes, YUnit::Bits, YUnit::Sum, YUnit::CountFrames,
+        YUnit::CountFields, YUnit::Max, YUnit::Min, YUnit::Avg,
+    ];
+    fn next(self) -> YUnit {
+        let i = Self::ALL.iter().position(|&u| u == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+    fn is_field(self) -> bool {
+        !matches!(self, YUnit::Packets | YUnit::Bytes | YUnit::Bits)
+    }
+    fn desc(self, field: &str) -> String {
+        let f = if field.is_empty() { "?" } else { field };
+        match self {
+            YUnit::Packets => "Packets".into(),
+            YUnit::Bytes => "Bytes".into(),
+            YUnit::Bits => "Bits".into(),
+            YUnit::Sum => format!("SUM({f})"),
+            YUnit::CountFrames => format!("COUNT FRAMES({f})"),
+            YUnit::CountFields => format!("COUNT FIELDS({f})"),
+            YUnit::Max => format!("MAX({f})"),
+            YUnit::Min => format!("MIN({f})"),
+            YUnit::Avg => format!("AVG({f})"),
+        }
+    }
+}
+
+fn iog_color_name(c: u8) -> &'static str {
+    match c {
+        caca::GREEN => "Green",
+        caca::YELLOW => "Yellow",
+        caca::LIGHTRED => "Red",
+        caca::LIGHTCYAN => "Cyan",
+        caca::LIGHTMAGENTA => "Magenta",
+        caca::WHITE => "White",
+        caca::LIGHTBLUE => "Blue",
+        caca::BROWN => "Orange",
+        _ => "?",
+    }
+}
+fn iog_style_name(s: i32) -> &'static str {
+    ["Line", "Impulse", "Bar", "Dot"][(s & 3) as usize]
+}
+
+/// One graph line: a display filter, a colour/style, and a Y-axis mode.
+struct IogSeries {
+    enabled: bool,
+    name: String,
+    filter_text: String,
+    filter: Option<Filter>, // None = match all
+    color: u8,
+    style: i32,
+    yunit: YUnit,
+    yfield: String,
+}
+
+/// `(#occurrences, #numeric, sum, min, max)` of `abbrev` in a dissection.
+fn iog_field_stats(root: &libpcapng::Field, abbrev: &str) -> (usize, usize, f64, f64, f64) {
+    fn walk(
+        f: &libpcapng::Field,
+        ab: &str,
+        nf: &mut usize,
+        nn: &mut usize,
+        sum: &mut f64,
+        lo: &mut f64,
+        hi: &mut f64,
+    ) {
+        if f.abbrev() == ab {
+            *nf += 1;
+            if f.ftype() == libpcapng::FieldType::Uint {
+                let v = f.uint() as f64;
+                if *nn == 0 {
+                    *lo = v;
+                    *hi = v;
+                } else {
+                    if v < *lo {
+                        *lo = v;
+                    }
+                    if v > *hi {
+                        *hi = v;
+                    }
+                }
+                *sum += v;
+                *nn += 1;
+            }
+        }
+        for c in f.children() {
+            walk(&c, ab, nf, nn, sum, lo, hi);
+        }
+    }
+    let (mut nf, mut nn, mut sum, mut lo, mut hi) = (0, 0, 0.0, 0.0, 0.0);
+    walk(root, abbrev, &mut nf, &mut nn, &mut sum, &mut lo, &mut hi);
+    (nf, nn, sum, lo, hi)
+}
+
+/// Bin every enabled series over the capture (one `Vec<f64>` of bins per series).
+fn iog_bins(cap: &Capture, ser: &[IogSeries], t0: u64, span_us: u64, interval: f64) -> Vec<Vec<f64>> {
+    let nb = (((span_us as f64) / (interval * 1e6)) as usize + 1).clamp(1, 4000);
+    let mut acc = vec![vec![0.0f64; nb]; ser.len()];
+    let mut cnt = vec![vec![0.0f64; nb]; ser.len()]; // sample counts (for AVG)
+    // Only dissect when a series needs it (a filter or a field mode).
+    let need = ser.iter().any(|g| g.enabled && (g.filter.is_some() || g.yunit.is_field()));
+    for p in &cap.pkts {
+        let b = ((p.ts_us.saturating_sub(t0) as f64) / (interval * 1e6)) as usize;
+        let b = b.min(nb - 1);
+        let d = if need { dissect::dissect(p) } else { None };
+        for (s, g) in ser.iter().enumerate() {
+            if !g.enabled {
+                continue;
+            }
+            if let Some(f) = &g.filter {
+                match &d {
+                    Some(dd) if f.eval(&dd.root()) => {}
+                    _ => continue,
+                }
+            }
+            match g.yunit {
+                YUnit::Packets => acc[s][b] += 1.0,
+                YUnit::Bytes => acc[s][b] += p.origlen as f64,
+                YUnit::Bits => acc[s][b] += p.origlen as f64 * 8.0,
+                _ => {
+                    let Some(dd) = &d else { continue };
+                    if g.yfield.is_empty() {
+                        continue;
+                    }
+                    let (nf, nn, sum, mn, mx) = iog_field_stats(&dd.root(), &g.yfield);
+                    match g.yunit {
+                        YUnit::CountFrames => {
+                            if nf > 0 {
+                                acc[s][b] += 1.0;
+                            }
+                        }
+                        YUnit::CountFields => acc[s][b] += nf as f64,
+                        _ if nn > 0 => match g.yunit {
+                            YUnit::Sum => acc[s][b] += sum,
+                            YUnit::Avg => {
+                                acc[s][b] += sum;
+                                cnt[s][b] += nn as f64;
+                            }
+                            YUnit::Max => {
+                                if cnt[s][b] == 0.0 || mx > acc[s][b] {
+                                    acc[s][b] = mx;
+                                }
+                                cnt[s][b] = 1.0;
+                            }
+                            YUnit::Min => {
+                                if cnt[s][b] == 0.0 || mn < acc[s][b] {
+                                    acc[s][b] = mn;
+                                }
+                                cnt[s][b] = 1.0;
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    for (s, g) in ser.iter().enumerate() {
+        if g.yunit == YUnit::Avg {
+            for i in 0..nb {
+                if cnt[s][i] > 0.0 {
+                    acc[s][i] /= cnt[s][i];
+                }
+            }
+        }
+    }
+    acc
+}
+
+/// Statistics ▸ IO Graph: a Wireshark-style modal — up to 8 series, each with
+/// its own display filter, colour, style and Y-axis mode; interval cycling and
+/// a log Y axis. Keys are shown along the bottom. Blocks until Esc / Enter / q.
+fn run_io_graph(ctx: &Gtcaca, app: &gtcaca::Application, state: &Rc<RefCell<AppState>>) {
+    // Time span of the capture.
+    let (t0, span_us, empty) = {
+        let st = state.borrow();
+        if st.cap.pkts.is_empty() {
+            (0, 1, true)
+        } else {
+            let mut lo = st.cap.pkts[0].ts_us;
+            let mut hi = lo;
+            for p in &st.cap.pkts {
+                lo = lo.min(p.ts_us);
+                hi = hi.max(p.ts_us);
+            }
+            (lo, (hi.saturating_sub(lo)).max(1), false)
+        }
+    };
+    if empty {
+        message("IO Graph", "No capture loaded.");
+        return;
+    }
+
+    // Default interval aiming for ~100 bins.
+    let want = span_us as f64 / 1e6 / 100.0;
+    let mut iv = IOG_INTERVALS
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| (**a - want).abs().total_cmp(&(**b - want).abs()))
+        .map(|(i, _)| i)
+        .unwrap_or(3);
+    let mut log_y = false;
+
+    // Default series: all packets, plus the active display filter (if any).
+    let mut ser: Vec<IogSeries> = vec![IogSeries {
+        enabled: true,
+        name: "All packets".into(),
+        filter_text: String::new(),
+        filter: None,
+        color: IOG_PALETTE[0],
+        style: gtcaca::linechart::LINE,
+        yunit: YUnit::Packets,
+        yfield: String::new(),
+    }];
+    {
+        let st = state.borrow();
+        if !st.filter_text.is_empty() {
+            if let Ok(f) = Filter::compile(&st.filter_text) {
+                ser.push(IogSeries {
+                    enabled: true,
+                    name: "Filter".into(),
+                    filter_text: st.filter_text.clone(),
+                    filter: Some(f),
+                    color: IOG_PALETTE[1],
+                    style: gtcaca::linechart::IMPULSE,
+                    yunit: YUnit::Packets,
+                    yfield: String::new(),
+                });
+            }
+        }
+    }
+
+    let ag = app.geometry();
+    let w = (ag.width - 6).clamp(48, 130);
+    let h = (ag.height - 4).max(16);
+    let win = gtcaca::Window::centered(app, Some("IO Graph"), w, h);
+    let c = win.content(PAD);
+    let ch = (c.height * 55 / 100).clamp(6, (c.height - 6).max(6));
+    let chart = gtcaca::Linechart::new(&win, c.x, c.y, c.width, ch);
+    let _hdr = Label::new(
+        &win,
+        "    Graph          Color     Style     Y-Axis            Display filter",
+        c.x,
+        c.y + ch,
+    );
+    let tl = gtcaca::Textlist::new(&win, c.x, c.y + ch + 1);
+    tl.set_view_size((c.height - ch - 3).max(1) as u32);
+    tl.set_search_enabled(false); // '/' should not open search here
+    let _help = Label::new(
+        &win,
+        "space on/off  f filter  F field  n name  c color  t style  y axis  i interval  L log  a add  d del  Esc",
+        c.x,
+        c.y + c.height - 1,
+    );
+
+    let mut sel = 0usize;
+
+    // Recompute the chart + config list for the current series/interval.
+    let refresh = |ser: &[IogSeries], sel: usize, iv: usize, log_y: bool| {
+        let interval = IOG_INTERVALS[iv];
+        let bins = {
+            let st = state.borrow();
+            iog_bins(&st.cap, ser, t0, span_us, interval)
+        };
+        chart.clear();
+        chart.set_log_y(log_y);
+        chart.set_xspan(span_us as f64 / 1e6, "s");
+        chart.set_title(&format!(
+            "IO Graph  \u{2014}  interval {interval} s{}",
+            if log_y { "  log-Y" } else { "" }
+        ));
+        for (s, g) in ser.iter().enumerate() {
+            if g.enabled {
+                chart.add_series_styled(&bins[s], g.color, g.style, &g.name);
+            }
+        }
+        tl.clear();
+        for (s, g) in ser.iter().enumerate() {
+            tl.append(&format!(
+                "{} {} {:<13.13} {:<8} {:<8} {:<17.17} {}",
+                if s == sel { ">" } else { " " },
+                if g.enabled { "[x]" } else { "[ ]" },
+                g.name,
+                iog_color_name(g.color),
+                iog_style_name(g.style),
+                g.yunit.desc(&g.yfield),
+                if g.filter_text.is_empty() { "(all packets)" } else { &g.filter_text },
+            ));
+        }
+    };
+    refresh(&ser, sel, iv, log_y);
+
     loop {
         ctx.redraw();
         chart.draw();
-        match gtcaca::poll_key(-1) {
-            Some(k) if k == key::ESCAPE || k == key::RETURN || k == b'q' as i32 => break,
-            _ => {}
+        tl.draw();
+        let Some(k) = gtcaca::poll_key(-1) else { continue };
+        let mut dirty = true;
+        match k {
+            key::ESCAPE | key::RETURN => break,
+            _ if k == b'q' as i32 => break,
+            key::UP => sel = sel.saturating_sub(1),
+            key::DOWN => sel = (sel + 1).min(ser.len() - 1),
+            _ if k == b' ' as i32 => ser[sel].enabled = !ser[sel].enabled,
+            _ if k == b'c' as i32 => {
+                let i = IOG_PALETTE.iter().position(|&p| p == ser[sel].color).unwrap_or(0);
+                ser[sel].color = IOG_PALETTE[(i + 1) % IOG_PALETTE.len()];
+            }
+            _ if k == b't' as i32 => ser[sel].style = (ser[sel].style + 1) & 3,
+            _ if k == b'y' as i32 => {
+                ser[sel].yunit = ser[sel].yunit.next();
+                if ser[sel].yunit.is_field() && ser[sel].yfield.is_empty() {
+                    if let Some(f) = prompt_line(ctx, app, "IO Graph", "Y field (e.g. tcp.window_size):") {
+                        if !f.trim().is_empty() {
+                            ser[sel].yfield = f.trim().to_string();
+                        }
+                    }
+                }
+            }
+            _ if k == b'F' as i32 => {
+                if let Some(f) = prompt_line(ctx, app, "IO Graph", "Y field (e.g. tcp.window_size):") {
+                    ser[sel].yfield = f.trim().to_string();
+                }
+            }
+            _ if k == b'i' as i32 => iv = (iv + 1) % IOG_INTERVALS.len(),
+            _ if k == b'L' as i32 => log_y = !log_y,
+            _ if k == b'n' as i32 => {
+                if let Some(n) = prompt_line(ctx, app, "IO Graph", "Graph name:") {
+                    if !n.trim().is_empty() {
+                        ser[sel].name = n.trim().to_string();
+                    }
+                }
+            }
+            _ if k == b'f' as i32 => {
+                if let Some(fx) = prompt_line(ctx, app, "IO Graph", "Display filter (blank = all):") {
+                    let fx = fx.trim().to_string();
+                    if fx.is_empty() {
+                        ser[sel].filter = None;
+                        ser[sel].filter_text.clear();
+                    } else {
+                        match Filter::compile(&fx) {
+                            Ok(f) => {
+                                ser[sel].filter = Some(f);
+                                ser[sel].filter_text = fx;
+                            }
+                            Err(e) => message("Filter error", &e),
+                        }
+                    }
+                }
+            }
+            _ if k == b'a' as i32 => {
+                if ser.len() < 8 {
+                    let idx = ser.len();
+                    ser.push(IogSeries {
+                        enabled: true,
+                        name: format!("Graph {}", idx + 1),
+                        filter_text: String::new(),
+                        filter: None,
+                        color: IOG_PALETTE[idx % IOG_PALETTE.len()],
+                        style: gtcaca::linechart::LINE,
+                        yunit: YUnit::Packets,
+                        yfield: String::new(),
+                    });
+                    sel = idx;
+                }
+            }
+            _ if k == b'd' as i32 => {
+                if ser.len() > 1 {
+                    ser.remove(sel);
+                    sel = sel.min(ser.len() - 1);
+                }
+            }
+            _ => dirty = false,
+        }
+        if dirty {
+            refresh(&ser, sel, iv, log_y);
         }
     }
     win.close();
@@ -1624,82 +2150,6 @@ fn prompt_line(ctx: &Gtcaca, app: &gtcaca::Application, title: &str, label: &str
     result
 }
 
-/// A searchable Conversations window. Returns the display filter of the chosen
-/// conversation (to apply to the main view), or `None` if cancelled.
-fn conversations_window(
-    ctx: &Gtcaca,
-    app: &gtcaca::Application,
-    state: &Rc<RefCell<AppState>>,
-) -> Option<String> {
-    let convs = crate::stats::conversations(&state.borrow().cap);
-    if convs.is_empty() {
-        message("Conversations", "No TCP/UDP conversations in this capture.");
-        return None;
-    }
-    // Parallel (display line, filter) so the selected line maps back to a filter.
-    let entries: Vec<(String, String)> = convs
-        .iter()
-        .map(|c| {
-            (
-                format!(
-                    "{:<24} {:<24} {:>6} pkt {:>10} B  {:>7.2}s  [{}]",
-                    c.a, c.b, c.packets, c.bytes, c.duration(), c.proto
-                ),
-                c.filter.clone(),
-            )
-        })
-        .collect();
-
-    let ag = app.geometry();
-    let w = 96.min(ag.width - 4).max(50);
-    let h = (entries.len() as i32 + 6).clamp(10, ag.height - 2);
-    let win = gtcaca::Window::centered(app, Some("Conversations — Enter to filter, type to search"), w, h);
-    let c = win.content(PAD);
-    let tl = gtcaca::Textlist::new(&win, c.x, c.y);
-    tl.set_view_size(c.height as u32);
-
-    let mut search = String::new();
-    let rebuild = |tl: &gtcaca::Textlist, search: &str| {
-        tl.clear();
-        let sl = search.to_lowercase();
-        for (line, _) in &entries {
-            if sl.is_empty() || line.to_lowercase().contains(&sl) {
-                tl.append(line);
-            }
-        }
-    };
-    rebuild(&tl, &search);
-
-    let chosen = loop {
-        ctx.redraw();
-        tl.draw();
-        let k = match gtcaca::poll_key(-1) {
-            Some(k) => k,
-            None => continue,
-        };
-        match k {
-            key::UP => tl.selection_up(),
-            key::DOWN => tl.selection_down(),
-            key::RETURN => {
-                break tl
-                    .selected()
-                    .and_then(|s| entries.iter().find(|(l, _)| *l == s).map(|(_, f)| f.clone()));
-            }
-            key::ESCAPE => break None,
-            key::BACKSPACE | key::DELETE => {
-                search.pop();
-                rebuild(&tl, &search);
-            }
-            ch if (0x20..0x7f).contains(&ch) => {
-                search.push(ch as u8 as char);
-                rebuild(&tl, &search);
-            }
-            _ => {}
-        }
-    };
-    win.close();
-    chosen
-}
 
 /// A blocking single-OK message dialog.
 fn message(title: &str, msg: &str) {
@@ -1857,14 +2307,6 @@ fn render_lines(b: &[u8]) -> Vec<String> {
     text.lines().map(|l| l.to_string()).collect()
 }
 
-
-fn proto_lines(cap: &Capture) -> Vec<String> {
-    let mut out = vec![format!("{:<12} {:>7} {:>10}", "Protocol", "Packets", "Bytes")];
-    for (n, p, b) in crate::stats::protocol_hierarchy(cap) {
-        out.push(format!("{n:<12} {p:>7} {b:>10}"));
-    }
-    out
-}
 
 /// Statistics ▸ Endpoints: per host:port packet/byte totals.
 fn endpoints_lines(cap: &Capture) -> Vec<String> {
@@ -2077,19 +2519,47 @@ fn navigate_table(state: &Rc<RefCell<AppState>>, k: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::io_buckets;
+    use super::{iog_bins, IogSeries, YUnit};
     use crate::model::{Capture, Packet};
 
     #[test]
-    fn io_buckets_spread_over_span() {
+    fn iog_bins_counts_all_packets_across_bins() {
         let mut cap = Capture::default();
         for i in 0..10u64 {
-            cap.push(Packet::new(vec![], 0, i * 1_000_000, 1, 0)); // 1s apart
+            cap.push(Packet::new(vec![], 100, i * 1_000_000, 1, 0)); // 1s apart, 100 bytes
         }
-        let rows: Vec<usize> = (0..10).collect();
-        let (all, filt, span) = io_buckets(&cap, &rows, 10);
-        assert_eq!(all.iter().sum::<f64>(), 10.0);
-        assert_eq!(filt.iter().sum::<f64>(), 10.0);
-        assert!((span - 9.0).abs() < 1e-6);
+        let ser = vec![IogSeries {
+            enabled: true,
+            name: "all".into(),
+            filter_text: String::new(),
+            filter: None,
+            color: 2,
+            style: 0,
+            yunit: YUnit::Packets,
+            yfield: String::new(),
+        }];
+        // span = 9s, 1s intervals -> 10 bins, one packet each.
+        let bins = iog_bins(&cap, &ser, 0, 9_000_000, 1.0);
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].iter().sum::<f64>(), 10.0);
+        assert!(bins[0].iter().all(|&v| v == 1.0));
+
+        // Bytes mode: 100 bytes per packet.
+        let ser_bytes = vec![IogSeries { yunit: YUnit::Bytes, ..clone_series(&ser[0]) }];
+        let bytes = iog_bins(&cap, &ser_bytes, 0, 9_000_000, 1.0);
+        assert_eq!(bytes[0].iter().sum::<f64>(), 1000.0);
+    }
+
+    fn clone_series(s: &IogSeries) -> IogSeries {
+        IogSeries {
+            enabled: s.enabled,
+            name: s.name.clone(),
+            filter_text: s.filter_text.clone(),
+            filter: None,
+            color: s.color,
+            style: s.style,
+            yunit: s.yunit,
+            yfield: s.yfield.clone(),
+        }
     }
 }

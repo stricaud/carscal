@@ -15,6 +15,7 @@ mod objects;
 mod posa_dir;
 mod script;
 mod source;
+mod statstree;
 mod stats;
 mod stream;
 mod ui;
