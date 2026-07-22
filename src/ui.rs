@@ -2182,7 +2182,8 @@ fn goto_refresh(
 /// Run gtcaca's blocking file chooser; returns the chosen path, or `None`.
 fn choose_file() -> Option<String> {
     let start = std::ffi::CString::new(".").unwrap();
-    let mut buf = [0i8; 1024];
+    // c_char (not i8): char is unsigned on some targets, e.g. aarch64 Linux.
+    let mut buf = [0 as std::os::raw::c_char; 1024];
     let ok = unsafe {
         gtcaca::ffi::gtcaca_filechooser_run(start.as_ptr(), buf.as_mut_ptr(), buf.len() as i32, 0)
     };
