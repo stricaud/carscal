@@ -5,6 +5,10 @@ edition = "2021"
 description = "A terminal packet analyzer — a tiny Wireshark for the TUI, in Rust. Rust replica of carcal."
 license = "MIT"
 repository = "https://github.com/stricaud/carscal"
+homepage = "https://github.com/stricaud/carscal"
+readme = "README.md"
+keywords = ["pcap", "wireshark", "tui", "network", "packet"]
+categories = ["command-line-utilities", "network-programming"]
 authors = ["Seb Tricaud <sebastien.tricaud@proton.me>"]
 
 [dependencies]
@@ -15,3 +19,8 @@ mlua = { version = "0.9", features = ["luajit", "vendored"] }
 
 [profile.release]
 opt-level = 3
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

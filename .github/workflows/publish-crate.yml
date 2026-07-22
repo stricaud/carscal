@@ -1,0 +1,28 @@
+# Publish carscal to crates.io on a version tag (e.g. `v0.1.0`), the same tag
+# that triggers the `dist` release. Requires a `CARGO_REGISTRY_TOKEN` repo
+# secret (crates.io API token with publish scope).
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch: {} # allow a manual run from the Actions tab
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # libcaca is needed to build/verify the crate during `cargo publish`.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcaca-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish
+        run: cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"

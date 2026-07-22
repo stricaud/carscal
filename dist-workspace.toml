@@ -1,0 +1,37 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "homebrew"]
+# Publish the generated formula to the Homebrew tap (needs a PAT secret; see below)
+tap = "stricaud/homebrew-tap"
+publish-jobs = ["homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax).
+# Windows is omitted: libcaca is not readily available there.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+
+# libcaca is carscal's one external C dependency. Install it on the CI runners
+# so the build (pkg-config) works, and declare it as a Homebrew dependency so
+# `brew install` pulls it in for the user at runtime.
+[dist.dependencies.apt]
+libcaca-dev = '*'
+
+[dist.dependencies.homebrew]
+libcaca = '*'
