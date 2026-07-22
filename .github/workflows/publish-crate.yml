@@ -24,5 +24,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # No --locked: Cargo.lock is gitignored in this repo.
       - name: Publish
-        run: cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        run: cargo publish --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
