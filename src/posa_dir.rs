@@ -8,17 +8,69 @@
 use std::path::PathBuf;
 
 /// Load every `.posa` decoder we can find. Returns the number of protocols added.
+/// Per-file load errors are reported to stderr.
 pub fn load_all() -> i32 {
-    let mut total = 0;
+    load_all_reporting(false).protocols
+}
+
+/// The outcome of a decoder-loading pass.
+pub struct LoadReport {
+    pub protocols: i32,
+    pub files_ok: i32,
+    pub files_err: i32,
+}
+
+/// Load every `.posa` decoder from all candidate directories, one file at a time
+/// so a broken file is named on stderr instead of silently skipped. With
+/// `verbose`, also logs each directory scanned and each file loaded — used by
+/// `--check-decoders` to test a decoder set without launching the UI.
+pub fn load_all_reporting(verbose: bool) -> LoadReport {
+    let mut r = LoadReport { protocols: 0, files_ok: 0, files_err: 0 };
+    let mut seen = std::collections::HashSet::new();
     for dir in candidate_dirs() {
-        if dir.is_dir() {
-            let n = libpcapng::posa::load_dir(&dir);
-            if n > 0 {
-                total += n;
+        if !dir.is_dir() {
+            continue;
+        }
+        // Several candidates can resolve to the same directory (e.g. the exe's
+        // ../protos and a relative "protos"); load each only once.
+        let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("posa")))
+                .collect(),
+            Err(e) => {
+                eprintln!("carscal: cannot read decoder dir {}: {e}", dir.display());
+                continue;
+            }
+        };
+        files.sort();
+        if verbose {
+            eprintln!("carscal: scanning {} ({} .posa file{})", dir.display(), files.len(), if files.len() == 1 { "" } else { "s" });
+        }
+        for f in files {
+            match libpcapng::posa::load_file(&f) {
+                // A file may legitimately define 0 protocols (e.g. it only carries
+                // coloring/display rules), so 0 is not an error.
+                Ok(n) => {
+                    r.protocols += n;
+                    r.files_ok += 1;
+                    if verbose {
+                        eprintln!("  ok   {}  ({n} protocol{})", f.display(), if n == 1 { "" } else { "s" });
+                    }
+                }
+                Err(e) => {
+                    r.files_err += 1;
+                    eprintln!("  FAIL {}: {e}", f.display());
+                }
             }
         }
     }
-    total
+    r
 }
 
 /// The user's `colorfilters` file (first found in a protos dir), if any.

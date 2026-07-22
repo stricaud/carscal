@@ -94,6 +94,11 @@ impl ColorRules {
         self.rules.len()
     }
 
+    /// The rules as `(expr, fg, bg)` triples, for a viewer.
+    pub fn list(&self) -> Vec<(String, u8, u8)> {
+        self.rules.iter().map(|r| (r.expr.clone(), r.fg, r.bg)).collect()
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }

@@ -25,9 +25,21 @@ use std::sync::RwLock;
 struct DecodeRule {
     cond: Filter,
     decoder: String,
+    /// The original condition text, kept for display (e.g. a Decoders viewer).
+    cond_text: String,
 }
 
 static DECODE_RULES: RwLock<Vec<DecodeRule>> = RwLock::new(Vec::new());
+
+/// The loaded conditional decode rules as `"<condition> => <Decoder>"` strings.
+pub fn list_rules() -> Vec<String> {
+    DECODE_RULES
+        .read()
+        .unwrap()
+        .iter()
+        .map(|r| format!("{} => {}", r.cond_text, r.decoder))
+        .collect()
+}
 
 /// Register a conditional rule `"<display-filter condition> => <Decoder>"`.
 /// The condition may use the full display-filter grammar (`&&`, `||`, `!`, `()`).
@@ -41,7 +53,7 @@ pub fn add_rule(spec: &str) -> Result<(), String> {
         return Err(format!("empty condition or decoder in {spec:?}"));
     }
     let cond = Filter::compile(&cond_text).map_err(|e| format!("bad condition: {e}"))?;
-    DECODE_RULES.write().unwrap().push(DecodeRule { cond, decoder });
+    DECODE_RULES.write().unwrap().push(DecodeRule { cond, decoder, cond_text });
     Ok(())
 }
 

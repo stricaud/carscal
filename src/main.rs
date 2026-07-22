@@ -11,6 +11,7 @@ mod filter;
 mod find;
 mod l4;
 mod model;
+mod objects;
 mod posa_dir;
 mod script;
 mod source;
@@ -30,12 +31,16 @@ USAGE:
     carscal --dump <capture> [filter]     headless: dissect to stdout and exit
     carscal --summary <capture> [filter]  headless: one line per packet (like tshark)
     carscal --protocols                   list built-in + loaded .posa decoders
+    carscal --check-decoders              load ~/.carscal/decoders/*.posa (+rules),
+                                          report per-file errors, and exit
     carscal --colors [capture]            list coloring rules (and, with a
                                           capture, which rule paints each packet)
     carscal --follow <capture> <pkt#>     reassemble & print that packet's TCP/UDP
                                           conversation (Follow Stream)
     carscal --find <capture> <query>      list packets matching text or hex:DE AD..
     carscal --stats <what> <capture>      conv | endpoints | proto  (Statistics)
+    carscal --export-objects <http|smb> <capture> [outdir]
+                                          carve transferred files (Export Objects)
     carscal --interfaces                  list capture interfaces
     carscal -s <script.lua> -r <capture>  run a Lua script over the capture (MQS)
     carscal -i <interface>                capture live from an interface
@@ -62,6 +67,12 @@ fn main() {
 }
 
 fn run(args: &[String]) -> i32 {
+    // `--check-decoders` does its own verbose load and exits, so run it before
+    // the silent startup load below (which would otherwise double-load).
+    if matches!(args.first().map(String::as_str), Some("--check-decoders" | "--test-decoders")) {
+        return cmd_check_decoders();
+    }
+
     // Load bundled + user .posa decoders so they participate in dissection.
     posa_dir::load_all();
     // Load any user conditional Decode-As rules (protos/decoders.rules).
@@ -162,6 +173,7 @@ fn run(args: &[String]) -> i32 {
             cmd_protocols();
             0
         }
+        Some("--export-objects") => cmd_export_objects(&args[1..]),
         Some("--stats") => cmd_stats(&args[1..]),
         Some("--colors") => cmd_colors(&args[1..]),
         Some("--follow") => cmd_follow(&args[1..]),
@@ -190,6 +202,80 @@ fn run(args: &[String]) -> i32 {
                     1
                 }
             }
+        }
+    }
+}
+
+/// `--check-decoders`: load every `.posa` decoder (and the conditional
+/// `decoders.rules`) with verbose per-file reporting, print a summary, and exit
+/// — without launching the UI. Exit status is non-zero if any file failed, so
+/// it's usable as a CI/install check. Details + errors go to stderr; the summary
+/// to stdout.
+fn cmd_check_decoders() -> i32 {
+    let r = posa_dir::load_all_reporting(true);
+    let mut rule_err = false;
+    if let Some(f) = posa_dir::decoders_rules_file() {
+        match decode::load_rules_file(&f) {
+            Ok(n) => eprintln!("  ok   {f}  ({n} decode rule{})", if n == 1 { "" } else { "s" }),
+            Err(e) => {
+                rule_err = true;
+                eprintln!("  FAIL {f}: {e}");
+            }
+        }
+    }
+    println!(
+        "{} protocols from {} file(s); {} file error(s)",
+        r.protocols, r.files_ok, r.files_err
+    );
+    if r.files_err > 0 || rule_err { 1 } else { 0 }
+}
+
+/// `--export-objects <http|smb> <capture> [outdir]` — carve transferred files
+/// (Wireshark's "Export Objects"). With an outdir the files are written there;
+/// without one, the objects are just listed.
+fn cmd_export_objects(args: &[String]) -> i32 {
+    let proto = args.first().and_then(|s| objects::proto_from_str(s));
+    let (proto, file) = match (proto, args.get(1)) {
+        (Some(p), Some(f)) => (p, f),
+        _ => {
+            eprintln!("usage: carscal --export-objects <http|smb> <capture> [outdir]");
+            return 2;
+        }
+    };
+    let cap = match source::load(file) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("carscal: {e}");
+            return 1;
+        }
+    };
+    let objs = objects::extract(&cap, proto);
+    match args.get(2) {
+        Some(dir) => match objects::save_all(&objs, std::path::Path::new(dir)) {
+            Ok(n) => {
+                println!("wrote {n} object(s) to {dir}");
+                0
+            }
+            Err(e) => {
+                eprintln!("carscal: {e}");
+                1
+            }
+        },
+        None => {
+            println!("{:>6}  {:<5} {:>10}  {:<5} {}", "frame", "proto", "bytes", "state", "name");
+            for o in &objs {
+                let name = if o.filename.is_empty() { &o.hostname } else { &o.filename };
+                println!(
+                    "{:>6}  {:<5} {:>10}  {:<5} {}",
+                    o.frame,
+                    o.proto,
+                    o.data.len(),
+                    if o.complete { "ok" } else { "part" },
+                    name
+                );
+            }
+            println!("{} object(s)", objs.len());
+            0
         }
     }
 }

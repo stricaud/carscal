@@ -11,11 +11,13 @@
 //! function finish(stats) end   -- once, after processing
 //! ```
 //!
-//! `pkt` carries `number,time,len,protocol,src,dst,info,srcport,dstport,payload,
-//! raw,layers,fields` and the methods `pkt:has(abbrev)`, `pkt:get(abbrev)` and
-//! `pkt:matches(display_filter)`. `s` carries `data` (new bytes), `all`
+//! `pkt` carries `number,time,len,linktype,protocol,src,dst,info,srcport,dstport,
+//! payload,raw,layers,fields` and the methods `pkt:has(abbrev)`, `pkt:get(abbrev)`
+//! and `pkt:matches(display_filter)`. `s` carries `data` (new bytes), `all`
 //! (cumulative), `src/dst/srcport/dstport/dir`. Globals: `carscal.hex(bytes)`,
-//! `carscal.protocols()`, `carscal.dissect(bytes[,linktype])`.
+//! `carscal.protocols()`, `carscal.dissect(bytes[,linktype])`, and
+//! `carscal.objects("http"|"smb")` — an extractor with `ex:add(pkt)` and
+//! `ex:extract()` for carving files (HTTP/SMB) out of live traffic.
 
 use crate::filter::Filter;
 use crate::l4;
@@ -151,8 +153,63 @@ fn ipv4_u32(raw: &[u8]) -> u32 {
 }
 
 /// The `carscal` global table.
+/// A Lua handle to an object (file) extractor, so a script can carve HTTP/SMB
+/// files live: feed packets in `packet(pkt)` with `ex:add(pkt)`, then read the
+/// results in `finish()` with `ex:extract()`.
+struct LuaObjects(std::cell::RefCell<libpcapng::ObjectExtractor>);
+
+impl mlua::UserData for LuaObjects {
+    fn add_methods<'lua, M: mlua::UserDataMethods<'lua, Self>>(methods: &mut M) {
+        // ex:add(pkt) — feed one packet table (uses pkt.raw / number / linktype).
+        methods.add_method("add", |_, this, pkt: Table| {
+            let raw: mlua::String = pkt.get("raw")?;
+            let frame: i64 = pkt.get("number").unwrap_or(0);
+            let lt: i64 = pkt.get("linktype").unwrap_or(linktype::ETHERNET as i64);
+            this.0.borrow_mut().add_packet(frame as i32, raw.as_bytes(), lt as u16);
+            Ok(())
+        });
+        // ex:extract() — parse the accumulated streams and return the objects.
+        methods.add_method("extract", |lua, this, ()| {
+            let mut ex = this.0.borrow_mut();
+            ex.finish();
+            let out = lua.create_table()?;
+            for (i, o) in ex.objects().into_iter().enumerate() {
+                let t = lua.create_table()?;
+                t.set("proto", o.proto)?;
+                t.set("frame", o.frame)?;
+                t.set("hostname", o.hostname)?;
+                t.set("content_type", o.content_type)?;
+                t.set("filename", o.filename)?;
+                t.set("data", lua.create_string(&o.data)?)?;
+                t.set("complete", o.complete)?;
+                out.set(i + 1, t)?;
+            }
+            Ok(out)
+        });
+    }
+}
+
 fn install_globals(lua: &Lua) -> Result<(), String> {
     let t = lua.create_table().map_err(lua_err)?;
+
+    // carscal.objects("http"|"smb") -> an extractor userdata (ex:add, ex:extract)
+    t.set(
+        "objects",
+        lua.create_function(|_, proto: mlua::String| {
+            let p = match proto.to_str()?.to_ascii_lowercase().as_str() {
+                "http" => libpcapng::ObjectProto::Http,
+                "smb" => libpcapng::ObjectProto::Smb,
+                other => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "unknown object proto {other:?} (use \"http\" or \"smb\")"
+                    )))
+                }
+            };
+            Ok(LuaObjects(std::cell::RefCell::new(libpcapng::ObjectExtractor::new(p))))
+        })
+        .map_err(lua_err)?,
+    )
+    .map_err(lua_err)?;
 
     t.set(
         "hex",
@@ -241,6 +298,7 @@ fn build_packet<'a>(
     t.set("number", number).map_err(lua_err)?;
     t.set("time", (ts_us.saturating_sub(first_ts)) as f64 / 1e6).map_err(lua_err)?;
     t.set("len", origlen).map_err(lua_err)?;
+    t.set("linktype", lt).map_err(lua_err)?;
     t.set("raw", lua.create_string(frame).map_err(lua_err)?).map_err(lua_err)?;
 
     if let Some(d) = &d {

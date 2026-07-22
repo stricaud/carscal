@@ -70,6 +70,14 @@ mod act {
     pub const CAPTURE_START: i32 = 19;
     pub const CAPTURE_STOP: i32 = 20;
     pub const CAPTURE_FOLLOW: i32 = 21;
+    pub const RELOAD: i32 = 22;
+    pub const UNMARK_ALL: i32 = 23;
+    pub const RESET_COLUMNS: i32 = 24;
+    pub const STATS_ENDPOINTS: i32 = 25;
+    pub const COLOR_RULES: i32 = 26;
+    pub const DECODERS: i32 = 27;
+    pub const EXPORT_HTTP: i32 = 28;
+    pub const EXPORT_SMB: i32 = 29;
 }
 
 thread_local! {
@@ -109,7 +117,11 @@ fn build_menu() -> Menus {
 
     let file = m.add_entry("File");
     m.add_item(file, "Open\u{2026}", "F2", menu_cb, id(act::OPEN));
+    needs.push((file, m.add_item(file, "Reload", "", menu_cb, id(act::RELOAD))));
     needs.push((file, m.add_item(file, "Save As\u{2026}", "^S", menu_cb, id(act::SAVE))));
+    m.add_separator(file);
+    needs.push((file, m.add_item(file, "Export HTTP Objects\u{2026}", "", menu_cb, id(act::EXPORT_HTTP))));
+    needs.push((file, m.add_item(file, "Export SMB Objects\u{2026}", "", menu_cb, id(act::EXPORT_SMB))));
     m.add_separator(file);
     m.add_item(file, "Quit", "^Q", menu_cb, id(act::QUIT));
 
@@ -118,10 +130,14 @@ fn build_menu() -> Menus {
     needs.push((edit, m.add_item(edit, "Find Next", "n", menu_cb, id(act::FIND_NEXT))));
     needs.push((edit, m.add_item(edit, "Find Previous", "N", menu_cb, id(act::FIND_PREV))));
     m.add_separator(edit);
+    needs.push((edit, m.add_item(edit, "Go to Packet\u{2026}", "^G", menu_cb, id(act::GOTO))));
+    m.add_separator(edit);
     needs.push((edit, m.add_item(edit, "Mark/Unmark Packet", "m", menu_cb, id(act::MARK))));
+    needs.push((edit, m.add_item(edit, "Unmark All", "", menu_cb, id(act::UNMARK_ALL))));
 
     let view = m.add_entry("View");
     needs.push((view, m.add_item(view, "Colorize Packet List", "C", menu_cb, id(act::COLORIZE))));
+    m.add_item(view, "Coloring Rules\u{2026}", "", menu_cb, id(act::COLOR_RULES));
 
     let capture = m.add_entry("Capture");
     let cap_start = m.add_item(capture, "Start\u{2026}", "", menu_cb, id(act::CAPTURE_START));
@@ -131,14 +147,17 @@ fn build_menu() -> Menus {
     let analyze = m.add_entry("Analyze");
     needs.push((analyze, m.add_item(analyze, "Apply as Filter", "=", menu_cb, id(act::APPLY_FILTER))));
     needs.push((analyze, m.add_item(analyze, "Apply as Column", "|", menu_cb, id(act::APPLY_COLUMN))));
+    needs.push((analyze, m.add_item(analyze, "Remove Custom Columns", "", menu_cb, id(act::RESET_COLUMNS))));
     needs.push((analyze, m.add_item(analyze, "Conversation Filter", "c", menu_cb, id(act::CONV))));
     m.add_separator(analyze);
     needs.push((analyze, m.add_item(analyze, "Follow TCP/UDP Stream", "S", menu_cb, id(act::FOLLOW))));
     needs.push((analyze, m.add_item(analyze, "Decode As\u{2026}", "D", menu_cb, id(act::DECODE))));
+    m.add_item(analyze, "Decoders\u{2026}", "", menu_cb, id(act::DECODERS));
 
     let stats = m.add_entry("Statistics");
     needs.push((stats, m.add_item(stats, "IO Graph", "I", menu_cb, id(act::IOGRAPH))));
     needs.push((stats, m.add_item(stats, "Conversations", "", menu_cb, id(act::STATS_CONV))));
+    needs.push((stats, m.add_item(stats, "Endpoints", "", menu_cb, id(act::STATS_ENDPOINTS))));
     needs.push((stats, m.add_item(stats, "Protocol Hierarchy", "", menu_cb, id(act::STATS_PROTO))));
 
     let help = m.add_entry("Help");
@@ -680,8 +699,65 @@ pub fn run(cap: Capture) -> Result<(), String> {
                         state.borrow_mut().status = "Save As: type a path via File ▸ Open flow (TODO)".into()
                     }
                     act::GOTO => {
-                        state.borrow_mut().status = "Go to packet: use ↑↓ / PgUp / Home / End".into()
+                        if let Some(s) = prompt_line(&ctx, &app, "Go to Packet", "Packet number:") {
+                            match s.trim().parse::<u64>() {
+                                Ok(n) => {
+                                    let row = {
+                                        let st = state.borrow();
+                                        st.rows.iter().position(|&i| st.cap.pkts[i].number == n)
+                                    };
+                                    match row {
+                                        Some(r) => {
+                                            goto(r);
+                                            focus = Focus::Table;
+                                        }
+                                        None => state.borrow_mut().status = format!("no packet {n} in view"),
+                                    }
+                                }
+                                Err(_) => state.borrow_mut().status = "not a packet number".into(),
+                            }
+                        }
                     }
+                    act::RELOAD => {
+                        let path = state.borrow().cap.path.clone();
+                        if path.is_empty() || path.starts_with("live:") {
+                            state.borrow_mut().status = "nothing to reload".into();
+                        } else {
+                            match load_into(&state, &path) {
+                                Ok(()) => goto(0),
+                                Err(e) => state.borrow_mut().status = format!("reload failed: {e}"),
+                            }
+                        }
+                    }
+                    act::UNMARK_ALL => {
+                        let mut st = state.borrow_mut();
+                        for p in st.cap.pkts.iter_mut() {
+                            p.marked = false;
+                        }
+                        st.status = "all marks cleared".into();
+                    }
+                    act::RESET_COLUMNS => {
+                        state.borrow_mut().extra_columns.clear();
+                        set_widths(&table, &base_w, 0);
+                        state.borrow_mut().status = "custom columns removed".into();
+                    }
+                    act::STATS_ENDPOINTS => {
+                        let lines = endpoints_lines(&state.borrow().cap);
+                        show_text_modal(&ctx, &app, "Endpoints", &lines);
+                    }
+                    act::COLOR_RULES => {
+                        let lines = color_rules_lines(&state.borrow().colors);
+                        show_text_modal(&ctx, &app, "Coloring Rules", &lines);
+                    }
+                    act::DECODERS => {
+                        let mut lines = crate::decode::list_rules();
+                        if lines.is_empty() {
+                            lines.push("(no decode rules loaded)".into());
+                        }
+                        show_text_modal(&ctx, &app, "Decoders", &lines);
+                    }
+                    act::EXPORT_HTTP => export_objects(&ctx, &app, &state, libpcapng::ObjectProto::Http, "HTTP"),
+                    act::EXPORT_SMB => export_objects(&ctx, &app, &state, libpcapng::ObjectProto::Smb, "SMB"),
                     _ => {}
                 }
             }
@@ -1788,6 +1864,83 @@ fn proto_lines(cap: &Capture) -> Vec<String> {
         out.push(format!("{n:<12} {p:>7} {b:>10}"));
     }
     out
+}
+
+/// Statistics ▸ Endpoints: per host:port packet/byte totals.
+fn endpoints_lines(cap: &Capture) -> Vec<String> {
+    let eps = crate::stats::endpoints(cap);
+    let mut out = vec![format!("{:<42} {:>8} {:>12}", "Endpoint", "Packets", "Bytes")];
+    for (ep, p, b) in eps.iter().take(500) {
+        out.push(format!("{ep:<42} {p:>8} {b:>12}"));
+    }
+    if eps.is_empty() {
+        out.push("(no endpoints)".into());
+    }
+    out
+}
+
+/// View ▸ Coloring Rules: the active rules in priority order.
+fn color_rules_lines(colors: &ColorRules) -> Vec<String> {
+    let mut out = vec![format!(
+        "colorize: {}",
+        if colors.is_enabled() { "on" } else { "off" }
+    )];
+    let rules = colors.list();
+    for (expr, fg, bg) in &rules {
+        out.push(format!(
+            "{:>11} on {:<11}  {}",
+            crate::colorrules::color_name(*fg),
+            crate::colorrules::color_name(*bg),
+            expr
+        ));
+    }
+    if rules.is_empty() {
+        out.push("(no coloring rules)".into());
+    }
+    out
+}
+
+/// File ▸ Export … Objects: carve HTTP/SMB files from the loaded capture, save
+/// them to a directory the user names, and show what was written.
+fn export_objects(
+    ctx: &Gtcaca,
+    app: &gtcaca::Application,
+    state: &Rc<RefCell<AppState>>,
+    proto: libpcapng::ObjectProto,
+    label: &str,
+) {
+    let objs = crate::objects::extract(&state.borrow().cap, proto);
+    if objs.is_empty() {
+        state.borrow_mut().status = format!("no {label} objects found");
+        return;
+    }
+    let default = std::env::var("HOME")
+        .map(|h| format!("{h}/carscal-{}-objects", label.to_lowercase()))
+        .unwrap_or_else(|_| format!("carscal-{}-objects", label.to_lowercase()));
+    let Some(input) = prompt_line(
+        ctx,
+        app,
+        &format!("Export {label} Objects ({} found)", objs.len()),
+        &format!("Save to dir [{default}]:"),
+    ) else {
+        return;
+    };
+    let dir = if input.trim().is_empty() { default } else { input.trim().to_string() };
+    match crate::objects::save_all(&objs, std::path::Path::new(&dir)) {
+        Ok(n) => {
+            let mut lines = vec![format!("Saved {n} {label} object(s) to:"), dir, String::new()];
+            for (i, o) in objs.iter().enumerate() {
+                lines.push(format!(
+                    "{:>10} bytes  {}{}",
+                    o.data.len(),
+                    crate::objects::safe_name(o, i),
+                    if o.complete { "" } else { "  (partial)" }
+                ));
+            }
+            show_text_modal(ctx, app, &format!("{label} Objects"), &lines);
+        }
+        Err(e) => state.borrow_mut().status = format!("export failed: {e}"),
+    }
 }
 
 /// The credits shown to the right of the About photo, including the version.
