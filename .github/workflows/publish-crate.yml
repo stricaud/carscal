@@ -13,7 +13,11 @@ jobs:
   publish:
     runs-on: ubuntu-22.04
     steps:
+      # `protos/` is a submodule (stricaud/network.protos.posa); cargo packages
+      # its files, so it must be checked out before `cargo publish`.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       # libcaca is needed to build/verify the crate during `cargo publish`.
       - name: Install build dependencies

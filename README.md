@@ -51,7 +51,7 @@ files (`apt install libcaca-dev`, `dnf install libcaca-devel`, or
 ### From source
 
 ```sh
-git clone https://github.com/stricaud/carscal && cd carscal
+git clone --recursive https://github.com/stricaud/carscal && cd carscal
 cargo build --release
 ./target/release/carscal capture.pcapng
 ```
@@ -152,10 +152,16 @@ name is an existence test (`tcp`, `dns`). Aliases match either direction:
 
 Built-in dissectors (via libpcapng): Ethernet/802.1Q, IPv4, IPv6, ARP, TCP, UDP,
 ICMP/ICMPv6, DNS. Everything else is reachable through `.posa` decoders — the
-bundled set (TFTP, RDP, DHCP, HTTP, SMB, TLS, IGMP, MySQL, …) plus your own,
-loaded at startup from `~/.carscal/decoders/`, the bundled `protos/`, or
+bundled set (HTTP/2, TLS, SMB, MySQL, PostgreSQL, Kerberos, LDAP, Modbus, MQTT,
+SIP, RTP, …) plus your own, loaded at startup from `~/.carscal/decoders/`, the
+bundled `protos/`, or
 `$CARSCAL_PROTOS_DIR` (carcal's `$CARCAL_PROTOS_DIR` also works). Validate a
 decoder set without launching the UI with `carscal --check-decoders`.
+
+`protos/` is a git submodule tracking
+[stricaud/network.protos.posa](https://github.com/stricaud/network.protos.posa),
+the shared `.posa` protocol collection — clone with `--recursive` (or run
+`git submodule update --init`) to get it.
 
 **Decode As** binds a port (or any display-filter condition) to a decoder;
 pcapng **Custom Blocks** are surfaced and their payload dissected (labelled with
