@@ -8,6 +8,16 @@
 use crate::model::{Packet, Summary};
 use libpcapng::{Dissection, Field, FieldType};
 
+/// The protocols libpcapng dissects in compiled-in C, i.e. without a `.posa`
+/// file. These are the names its dissector puts in the Protocol column; a
+/// `.posa` decoder of the same name takes over (the engine consults the posa
+/// registry first), which is what lets a bundled decoder replace one of these
+/// without a rebuild. Listed by `--list-protocols`.
+pub const BUILTIN_PROTOCOLS: &[&str] = &[
+    "ARP", "DHCP", "DNS", "Ethernet", "GRE", "HTTP", "ICMP", "ICMPv6", "IGMP", "IPv4", "IPv6",
+    "NBNS", "NTP", "QUIC", "RADIUS", "SNMP", "SSH", "TCP", "TLS", "UDP",
+];
+
 /// Dissect a packet into its field tree, or `None` on allocation failure.
 ///
 /// After the built-in/port-bound dissection, any matching conditional

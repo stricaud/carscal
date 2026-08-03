@@ -112,10 +112,11 @@ carscal --dump    capture.pcapng "dns"               # full field tree
 carscal --stats   conv capture.pcapng                # conv | endpoints | proto
 carscal --export-objects http capture.pcapng ./out   # carve files (Export Objects)
 carscal --find    capture.pcapng "hex:DE AD BE EF"   # find by text or bytes
-carscal --protocols                                  # list loaded .posa decoders
+carscal --list-protocols                             # every dissector: built-in + each .posa and its file
 carscal --check-decoders                             # load ~/.carscal/decoders and report errors
 carscal --interfaces                                 # list capture interfaces
 carscal --help
+carscal --version                                    # or -v
 ```
 
 ## Live scripting (Lua)

@@ -31,7 +31,8 @@ USAGE:
     carscal <capture.pcapng>              open a capture in the TUI
     carscal --dump <capture> [filter]     headless: dissect to stdout and exit
     carscal --summary <capture> [filter]  headless: one line per packet (like tshark)
-    carscal --protocols                   list built-in + loaded .posa decoders
+    carscal --list-protocols              list every loaded dissector: built-in
+                                          C decoders + each .posa and its file
     carscal --check-decoders              load ~/.carscal/decoders/*.posa (+rules),
                                           report per-file errors, and exit
     carscal --colors [capture]            list coloring rules (and, with a
@@ -46,6 +47,7 @@ USAGE:
     carscal -s <script.lua> -r <capture>  run a Lua script over the capture (MQS)
     carscal -i <interface>                capture live from an interface
     carscal --help                        show this help
+    carscal -v, --version                 print the version and exit
 
 OPTIONS (combine with any command or a capture file):
     -X \"<tcp|udp> <port> <Proto>\"          Decode As… — bind a port to a .posa
@@ -68,6 +70,12 @@ fn main() {
 }
 
 fn run(args: &[String]) -> i32 {
+    // `--version` answers from the crate metadata alone: no decoder loading.
+    if matches!(args.first().map(String::as_str), Some("-v" | "--version")) {
+        println!("carscal {}", env!("CARGO_PKG_VERSION"));
+        return 0;
+    }
+
     // `--check-decoders` does its own verbose load and exits, so run it before
     // the silent startup load below (which would otherwise double-load).
     if matches!(args.first().map(String::as_str), Some("--check-decoders" | "--test-decoders")) {
@@ -75,7 +83,13 @@ fn run(args: &[String]) -> i32 {
     }
 
     // Load bundled + user .posa decoders so they participate in dissection.
-    posa_dir::load_all();
+    // `--list-protocols` also wants to name the file each decoder came from, so
+    // it asks the loader to record origins (an extra registry snapshot per file).
+    if args.iter().any(|a| a == "--list-protocols" || a == "--protocols") {
+        posa_dir::load_all_tracked();
+    } else {
+        posa_dir::load_all();
+    }
     // Load any user conditional Decode-As rules (protos/decoders.rules).
     if let Some(f) = posa_dir::decoders_rules_file() {
         let _ = decode::load_rules_file(&f);
@@ -110,7 +124,7 @@ fn run(args: &[String]) -> i32 {
             }
             "-p" | "--posa" => {
                 if let Some(f) = args.get(i + 1) {
-                    if let Err(e) = libpcapng::posa::load_file(f) {
+                    if let Err(e) = posa_dir::load_extra(f) {
                         eprintln!("carscal: -p {f}: {e}");
                     }
                     i += 1;
@@ -170,8 +184,12 @@ fn run(args: &[String]) -> i32 {
             print!("{USAGE}");
             0
         }
-        Some("--protocols") => {
-            cmd_protocols();
+        Some("-v" | "--version") => {
+            println!("carscal {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        Some("--list-protocols" | "--protocols") => {
+            cmd_list_protocols();
             0
         }
         Some("--export-objects") => cmd_export_objects(&args[1..]),
@@ -281,11 +299,47 @@ fn cmd_export_objects(args: &[String]) -> i32 {
     }
 }
 
-fn cmd_protocols() {
-    println!("Loaded .posa decoders ({}):", libpcapng::posa::count());
-    for name in libpcapng::posa::protocols() {
-        println!("  {name}");
+/// `--list-protocols` — every dissector available to this build: the ones
+/// compiled into libpcapng, then each `.posa` decoder with the file it came
+/// from. A `.posa` decoder shadows a built-in of the same name (the engine
+/// consults the posa registry first), so those are called out.
+fn cmd_list_protocols() {
+    let posa = libpcapng::posa::protocols();
+    let origins = posa_dir::origins();
+    let posa_names: std::collections::HashSet<&str> = posa.iter().map(String::as_str).collect();
+    // One column width for both lists, so the sources line up throughout.
+    let w = posa
+        .iter()
+        .map(|n| n.len())
+        .chain(dissect::BUILTIN_PROTOCOLS.iter().map(|n| n.len()))
+        .max()
+        .unwrap_or(0);
+
+    println!("Built-in dissectors ({}):", dissect::BUILTIN_PROTOCOLS.len());
+    for name in dissect::BUILTIN_PROTOCOLS {
+        match posa_names.contains(name).then(|| origins.get(*name)) {
+            Some(Some(file)) => println!("  {name:<w$}  compiled in (overridden by {file})"),
+            Some(None) => println!("  {name:<w$}  compiled in (overridden by a .posa decoder)"),
+            None => println!("  {name:<w$}  compiled in"),
+        }
     }
+
+    println!("\n.posa decoders ({}):", posa.len());
+    for name in &posa {
+        match origins.get(name) {
+            Some(file) => println!("  {name:<w$}  {file}"),
+            None => println!("  {name}"),
+        }
+    }
+
+    let files: std::collections::HashSet<&String> = origins.values().collect();
+    println!(
+        "\n{} dissector(s): {} built-in, {} from {} .posa file(s)",
+        dissect::BUILTIN_PROTOCOLS.len() + posa.len(),
+        dissect::BUILTIN_PROTOCOLS.len(),
+        posa.len(),
+        files.len()
+    );
 }
 
 /// `--colors [capture]` — print the composed rules in consult order, and (if a

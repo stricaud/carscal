@@ -5,7 +5,14 @@
 //!   2. `$CARCAL_PROTOS_DIR` (compatible with carcal's env var)
 //!   3. `$CARSCAL_PROTOS_DIR`
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Which file each protocol name was first defined in. Only filled when a load
+/// pass is asked to track origins (`--list-protocols`), since the bookkeeping
+/// costs a registry snapshot per file.
+static ORIGINS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 /// Load every `.posa` decoder we can find. Returns the number of protocols added.
 /// Per-file load errors are reported to stderr.
@@ -18,6 +25,44 @@ pub struct LoadReport {
     pub protocols: i32,
     pub files_ok: i32,
     pub files_err: i32,
+}
+
+/// Load every `.posa` decoder, recording which file defined each protocol so
+/// `--list-protocols` can name the source of every decoder.
+pub fn load_all_tracked() -> i32 {
+    *ORIGINS.lock().unwrap() = Some(HashMap::new());
+    load_all_reporting(false).protocols
+}
+
+/// Load one extra `.posa` file (`-p`), attributing its protocols to it when
+/// origins are being tracked.
+pub fn load_extra(path: &str) -> Result<i32, String> {
+    load_one(Path::new(path)).map_err(|e| e.to_string())
+}
+
+/// The recorded protocol → file map (empty unless a tracked load ran).
+pub fn origins() -> HashMap<String, String> {
+    ORIGINS.lock().unwrap().clone().unwrap_or_default()
+}
+
+/// Load a single file, attributing any newly-defined protocol names to it when
+/// tracking is on. Redefinitions keep their first file, which is what the
+/// listing wants: the bundled tree defines each protocol once.
+fn load_one(path: &Path) -> Result<i32, libpcapng::Error> {
+    let mut guard = ORIGINS.lock().unwrap();
+    let before: Option<std::collections::HashSet<String>> = guard
+        .as_ref()
+        .map(|_| libpcapng::posa::protocols().into_iter().collect());
+    let n = libpcapng::posa::load_file(path)?;
+    if let (Some(map), Some(before)) = (guard.as_mut(), before) {
+        let file = path.to_string_lossy().into_owned();
+        for name in libpcapng::posa::protocols() {
+            if !before.contains(&name) {
+                map.insert(name, file.clone());
+            }
+        }
+    }
+    Ok(n)
 }
 
 /// Load every `.posa` decoder from all candidate directories, one file at a time
@@ -53,7 +98,7 @@ pub fn load_all_reporting(verbose: bool) -> LoadReport {
             eprintln!("carscal: scanning {} ({} .posa file{})", dir.display(), files.len(), if files.len() == 1 { "" } else { "s" });
         }
         for f in files {
-            match libpcapng::posa::load_file(&f) {
+            match load_one(&f) {
                 // A file may legitimately define 0 protocols (e.g. it only carries
                 // coloring/display rules), so 0 is not an error.
                 Ok(n) => {
