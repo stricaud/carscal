@@ -547,7 +547,7 @@ fn run_live<F: FnMut(&[u8], u16, u64) -> Result<(), String>>(
     }
     eprintln!("carscal: capturing on {dev} (Ctrl-C to stop)…");
     let mut err: Option<String> = None;
-    cap.run(0, |p| {
+    let _ = cap.run(0, |p| {
         if err.is_some() {
             return;
         }
